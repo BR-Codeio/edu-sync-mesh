@@ -1,8 +1,62 @@
-import React from 'react';
-import { X, PlayCircle, CheckCircle2, FileText } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { X, Play, Pause, RotateCcw, CheckCircle2, FileText } from 'lucide-react';
+
+const DURATION_SECONDS = 12 * 60 + 30; // 12:30, matches the label
+const PLAYBACK_SPEED = 12; // 1 real second = 12 simulated video seconds, so a 12:30 lesson "plays" in ~1 minute during a demo
 
 export default function LessonModal({ lesson, onClose, onComplete }) {
+  const [currentTime, setCurrentTime] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    // Reset playback whenever a new lesson is opened
+    setCurrentTime(0);
+    setPlaying(false);
+    return () => clearInterval(intervalRef.current);
+  }, [lesson?.id]);
+
+  useEffect(() => {
+    if (playing) {
+      intervalRef.current = setInterval(() => {
+        setCurrentTime((prev) => {
+          const next = prev + PLAYBACK_SPEED;
+          if (next >= DURATION_SECONDS) {
+            clearInterval(intervalRef.current);
+            setPlaying(false);
+            return DURATION_SECONDS;
+          }
+          return next;
+        });
+      }, 1000);
+    } else {
+      clearInterval(intervalRef.current);
+    }
+    return () => clearInterval(intervalRef.current);
+  }, [playing]);
+
   if (!lesson) return null;
+
+  const togglePlay = () => {
+    if (currentTime >= DURATION_SECONDS) {
+      setCurrentTime(0);
+    }
+    setPlaying((p) => !p);
+  };
+
+  const restart = () => {
+    setCurrentTime(0);
+    setPlaying(true);
+  };
+
+  const seekTo = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    setCurrentTime(Math.floor(ratio * DURATION_SECONDS));
+  };
+
+  const progressPct = (currentTime / DURATION_SECONDS) * 100;
+  const finished = currentTime >= DURATION_SECONDS;
 
   return (
     <div
@@ -23,10 +77,40 @@ export default function LessonModal({ lesson, onClose, onComplete }) {
         </div>
 
         <div className="p-6 space-y-5">
-          <div className="bg-gray-900 rounded-xl aspect-video flex items-center justify-center relative overflow-hidden">
-            <PlayCircle className="w-16 h-16 text-white/80" />
+          <div className="bg-gray-900 rounded-xl aspect-video flex items-center justify-center relative overflow-hidden group">
+            <button
+              onClick={togglePlay}
+              className="flex items-center justify-center w-16 h-16 rounded-full bg-white/10 hover:bg-white/20 transition"
+              aria-label={playing ? 'Pause' : 'Play'}
+            >
+              {finished ? (
+                <RotateCcw className="w-9 h-9 text-white" />
+              ) : playing ? (
+                <Pause className="w-9 h-9 text-white" />
+              ) : (
+                <Play className="w-9 h-9 text-white ml-1" />
+              )}
+            </button>
+
+            {finished && (
+              <span className="absolute top-3 left-1/2 -translate-x-1/2 text-xs font-semibold text-white bg-green-600 px-3 py-1 rounded-full">
+                Lesson video complete
+              </span>
+            )}
+
+            {/* Seek bar */}
+            <div
+              onClick={seekTo}
+              className="absolute bottom-8 left-3 right-3 h-1.5 bg-white/20 rounded-full cursor-pointer"
+            >
+              <div
+                className="h-full bg-orange-500 rounded-full transition-[width] duration-200"
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+
             <span className="absolute bottom-3 left-3 text-xs text-white/70 bg-black/40 px-2 py-1 rounded">
-              Offline video • 0:00 / 12:30
+              Offline video • {formatTime(currentTime)} / {formatTime(DURATION_SECONDS)}
             </span>
           </div>
 
@@ -64,6 +148,12 @@ export default function LessonModal({ lesson, onClose, onComplete }) {
       </div>
     </div>
   );
+}
+
+function formatTime(totalSeconds) {
+  const m = Math.floor(totalSeconds / 60);
+  const s = Math.floor(totalSeconds % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 function defaultKeyPoints(subject) {
