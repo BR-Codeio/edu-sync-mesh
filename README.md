@@ -32,7 +32,7 @@ This repo contains the interactive prototype (PWA) used to demo those three idea
 ## Getting Started
 
 ```bash
-git clone https://github.com/<your-username>/edu-sync-mesh.git
+git clone https://github.com/brightonrusere87-coder/edu-sync-mesh.git
 cd edu-sync-mesh
 npm install
 npm run dev
