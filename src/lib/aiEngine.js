@@ -211,11 +211,21 @@ const GREETINGS = ['hi', 'hello', 'mhoro', 'mhoroi', 'hesi', 'hey', 'good mornin
 const GREETING_RESPONSE =
   "Mhoro! Ndini AI Tutor yako, ndinogona kukubatsira ne Mathematics, Biology, Chemistry, Physics, English, Shona, Geography, History, uye Commerce. Ndibvunze chero chinhu chaunoda kudzidza — for example 'Explain photosynthesis' or 'Ndibatsire ne quadratic equations'.";
 
+// Shona: "I don't have a confident answer from what's on the Village Hub right now.
+// I've saved your question — once Data Mule Sync happens (teacher's phone or a USB
+// flash drive carried on the daily commuter bus to town), I'll look it up online and
+// bring back an answer. Check again after the next sync, or within 24 hours."
 const FALLBACK_RESPONSE =
-  "Handisati ndanzwisisa mubvunzo iwoyo zvakakwana — regai ndikubatsire nezvimwe zvinhu izvi zvandinoziva kunyanya: Mathematics (quadratic equations, algebra, fractions, geometry), Biology (cells, photosynthesis, respiration), Chemistry (periodic table, acids & bases, bonding), Physics (forces, energy, electricity, light), English (essays, grammar, comprehension), Shona (Mabviro Nemauto, tsumo, grammar), Geography (maps, climate), History (Chimurenga), and Commerce (accounting, supply & demand). Try asking about one of these topics in a full sentence.";
+  "Handisati ndanzwisisa mubvunzo iwoyo zvakakwana nezvinhu zvandinoziva pa-Village Hub parizvino. Ndakuchengetedza mubvunzo wako — kana Data Mule Sync yaitika (foni yemudzidzisi kana USB flash drive inofambiswa nebhazi rinofamba mazuva ese kuenda kutown), ndichaenda kunotsvaga mhinduro pa-internet uye ndichakupa yacho. Tarisa zvakare mushure meDataMule Sync inotevera, kana mumaawa makumi maviri nemana (24 hours).";
 
 function normalize(text) {
   return text.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** Builds a real, working search link for a queued question — used once
+ * connectivity returns via Data Mule Sync (teacher's phone or USB drive in town). */
+export function getSearchUrl(question) {
+  return `https://duckduckgo.com/?q=${encodeURIComponent(question + ' ZIMSEC syllabus')}`;
 }
 
 /**
@@ -228,11 +238,11 @@ export function getTutorResponse(rawQuery) {
   const query = normalize(rawQuery);
 
   if (!query) {
-    return { subject: null, text: FALLBACK_RESPONSE };
+    return { subject: null, text: FALLBACK_RESPONSE, unresolved: true };
   }
 
   if (GREETINGS.some((g) => query === g || query.startsWith(g + ' '))) {
-    return { subject: null, text: GREETING_RESPONSE };
+    return { subject: null, text: GREETING_RESPONSE, unresolved: false };
   }
 
   const queryWords = query.split(' ');
@@ -260,10 +270,10 @@ export function getTutorResponse(rawQuery) {
   }
 
   if (bestMatch && bestScore >= 1) {
-    return { subject: bestMatch.subject, text: bestMatch.answer };
+    return { subject: bestMatch.subject, text: bestMatch.answer, unresolved: false };
   }
 
-  return { subject: null, text: FALLBACK_RESPONSE };
+  return { subject: null, text: FALLBACK_RESPONSE, unresolved: true };
 }
 
 export function getAllSubjects() {

@@ -2,9 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Send, Wifi, WifiOff, Download, Upload, Users, BookOpen, Award, Zap, Radio,
   MessageSquare, FileText, ChevronRight, Home, Library, Trophy, Menu, X,
-  Server, Sparkles, Loader2, CheckCircle2,
+  Server, Sparkles, Loader2, CheckCircle2, Clock, ExternalLink, HelpCircle,
 } from 'lucide-react';
-import { getTutorResponse, SAMPLE_QUESTIONS } from './lib/aiEngine.js';
+import { getTutorResponse, getSearchUrl, SAMPLE_QUESTIONS } from './lib/aiEngine.js';
 import { useToast } from './components/Toast.jsx';
 import LessonModal from './components/LessonModal.jsx';
 import HubTestMode from './components/HubTestMode.jsx';
@@ -23,6 +23,22 @@ export default function EduSyncMesh() {
   const [isAITyping, setIsAITyping] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [viewingLesson, setViewingLesson] = useState(null);
+  const [pendingQuestions, setPendingQuestions] = useState(() => {
+    try {
+      const saved = localStorage.getItem('edu-sync-pending-questions');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('edu-sync-pending-questions', JSON.stringify(pendingQuestions));
+    } catch {
+      // Storage unavailable (e.g. private browsing) — queue just won't persist across reloads
+    }
+  }, [pendingQuestions]);
 
   const [lessons, setLessons] = useState([
     { id: 1, title: 'Mathematics - Quadratic Equations', subject: 'Maths', size: '15MB', downloaded: true, completed: false },
@@ -59,12 +75,33 @@ export default function EduSyncMesh() {
     const delay = Math.min(1800, 700 + query.length * 15);
 
     setTimeout(() => {
-      const { text, subject } = getTutorResponse(query);
+      const { text, subject, unresolved } = getTutorResponse(query);
       setChatMessages((prev) => [
         ...prev,
         { type: 'ai', text, subject, timestamp: nowStr() },
       ]);
       setIsAITyping(false);
+
+      if (unresolved) {
+        setPendingQuestions((prev) => {
+          const alreadyQueued = prev.some(
+            (p) => p.question.toLowerCase() === query.toLowerCase() && p.status === 'pending'
+          );
+          if (alreadyQueued) return prev;
+          return [
+            ...prev,
+            {
+              id: Date.now(),
+              question: query,
+              askedAt: new Date().toISOString(),
+              status: 'pending',
+            },
+          ];
+        });
+        showToast('Question saved — it\u2019ll be looked up on the next Data Mule Sync.', {
+          icon: <Clock className="w-6 h-6 text-amber-500" />,
+        });
+      }
     }, delay);
   };
 
@@ -123,9 +160,24 @@ export default function EduSyncMesh() {
           clearInterval(interval);
           setSyncing(false);
           setLastSynced(nowStr());
-          showToast('Sync complete! New content downloaded from Village Hub.', {
-            icon: <Zap className="w-6 h-6 text-teal-600" />,
-          });
+
+          const unresolvedCount = pendingQuestions.filter((p) => p.status === 'pending').length;
+          setPendingQuestions((prevQ) =>
+            prevQ.map((p) =>
+              p.status === 'pending' ? { ...p, status: 'resolved', resolvedAt: new Date().toISOString() } : p
+            )
+          );
+
+          if (unresolvedCount > 0) {
+            showToast(
+              `Sync complete! ${unresolvedCount} queued question${unresolvedCount > 1 ? 's' : ''} looked up online — check the AI Tutor tab.`,
+              { icon: <CheckCircle2 className="w-6 h-6 text-green-600" /> }
+            );
+          } else {
+            showToast('Sync complete! New content downloaded from Village Hub.', {
+              icon: <Zap className="w-6 h-6 text-teal-600" />,
+            });
+          }
           return 100;
         }
         return prev + 10;
@@ -273,7 +325,7 @@ export default function EduSyncMesh() {
                 <h3 className="font-bold text-lg">Data Mule Sync</h3>
               </div>
               <p className="text-sm text-green-100 mb-4">
-                Sync with Village Hub when teacher returns from town
+                Sync via teacher&apos;s phone or a USB flash drive carried on the daily commuter omnibus to town
               </p>
               <button
                 onClick={simulateSync}
@@ -525,6 +577,61 @@ export default function EduSyncMesh() {
                   <p className="text-xs text-gray-500 mt-2 text-center">
                     🔒 All AI processing happens locally on Village Hub • Zero data cost
                   </p>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'tutor' && pendingQuestions.length > 0 && (
+              <div className="mt-6 bg-white rounded-2xl shadow-xl p-6">
+                <h3 className="text-xl font-bold text-gray-800 mb-1 flex items-center gap-2">
+                  <HelpCircle className="w-6 h-6 text-amber-600" />
+                  Questions Waiting on Sync
+                </h3>
+                <p className="text-sm text-gray-600 mb-4">
+                  Questions the offline knowledge base couldn&apos;t answer confidently. They&apos;re looked up online
+                  automatically the next time a teacher&apos;s phone (or a USB flash drive carried on the daily
+                  commuter omnibus) syncs with an internet connection in town.
+                </p>
+                <div className="space-y-3">
+                  {pendingQuestions.slice().reverse().map((pq) => (
+                    <div
+                      key={pq.id}
+                      className={`p-4 rounded-xl border-2 ${
+                        pq.status === 'resolved' ? 'bg-green-50 border-green-300' : 'bg-amber-50 border-amber-300'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="font-semibold text-gray-800 flex-1">{pq.question}</p>
+                        {pq.status === 'resolved' ? (
+                          <span className="flex-shrink-0 flex items-center gap-1 text-xs font-bold text-green-700 bg-green-100 px-2 py-1 rounded-full">
+                            <CheckCircle2 className="w-3.5 h-3.5" /> Resolved
+                          </span>
+                        ) : (
+                          <span className="flex-shrink-0 flex items-center gap-1 text-xs font-bold text-amber-700 bg-amber-100 px-2 py-1 rounded-full">
+                            <Clock className="w-3.5 h-3.5" /> Waiting for sync
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Asked {new Date(pq.askedAt).toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' })}
+                      </p>
+                      {pq.status === 'resolved' ? (
+                        <a
+                          href={getSearchUrl(pq.question)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 mt-2 text-sm font-semibold text-green-700 hover:text-green-800 underline"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          View full answer online
+                        </a>
+                      ) : (
+                        <p className="text-xs text-amber-700 mt-2">
+                          Check again after the next Data Mule Sync, or within 24 hours.
+                        </p>
+                      )}
+                    </div>
+                  ))}
                 </div>
               </div>
             )}

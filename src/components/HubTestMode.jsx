@@ -29,7 +29,7 @@ const STEPS = [
   {
     id: 'data-mule',
     title: 'Data Mule Sync Triggers',
-    detail: "Teacher's phone re-enters Wi-Fi range after a trip to town. PouchDB on the phone auto-replicates new curriculum updates to the Hub's CouchDB.",
+    detail: "Teacher's phone — or a USB flash drive carried on the daily commuter omnibus to town — re-enters Wi-Fi range or gets plugged into the Hub. PouchDB / file sync replicates new curriculum updates, and any questions the AI Tutor couldn't answer offline get looked up online and returned.",
     icon: RefreshCw,
   },
   {
