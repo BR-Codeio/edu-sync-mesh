@@ -6,3 +6,8 @@ html, body {
   margin: 0;
   padding: 0;
 }
+
+@keyframes slideIn {
+  from { transform: translateX(20px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
