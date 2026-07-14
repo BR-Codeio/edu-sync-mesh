@@ -1,0 +1,5 @@
+node_modules
+data/qa-store.json
+data/lessons.json
+data/uploads/
+*.log

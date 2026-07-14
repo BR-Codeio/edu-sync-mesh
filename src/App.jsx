@@ -1,13 +1,19 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Send, Wifi, WifiOff, Download, Upload, Users, BookOpen, Award, Zap, Radio,
-  MessageSquare, FileText, ChevronRight, Home, Library, Trophy, Menu, X,
-  Server, Sparkles, Loader2, CheckCircle2, Clock, ExternalLink, HelpCircle,
+  Wifi, WifiOff, Download, Users, Award, Zap, Radio,
+  MessageSquare, Home, Library, Menu, X,
+  Server, Loader2, CheckCircle2, Clock, UploadCloud,
 } from 'lucide-react';
-import { getTutorResponse, getSearchUrl, SAMPLE_QUESTIONS } from './lib/aiEngine.js';
+import { getTutorResponse } from './lib/aiEngine.js';
+import { checkBackendHealth, askTutorAPI, triggerSyncAPI, fetchPendingAPI, fetchResolvedAPI, fetchHubLessons } from './lib/api.js';
 import { useToast } from './components/Toast.jsx';
 import LessonModal from './components/LessonModal.jsx';
 import HubTestMode from './components/HubTestMode.jsx';
+import TeacherUpload from './components/TeacherUpload.jsx';
+import HomeTab from './components/tabs/HomeTab.jsx';
+import LibraryTab from './components/tabs/LibraryTab.jsx';
+import AITutorTab from './components/tabs/AITutorTab.jsx';
+import P2PShareTab from './components/tabs/P2PShareTab.jsx';
 
 export default function EduSyncMesh() {
   const { showToast } = useToast();
@@ -55,13 +61,97 @@ export default function EduSyncMesh() {
   const [downloadedCount, setDownloadedCount] = useState(8);
 
   const chatEndRef = useRef(null);
+  const [backendOnline, setBackendOnline] = useState(null); // null = checking, true/false once known
+  const [hubQA, setHubQA] = useState({ pending: [], resolved: [] }); // what's REALLY stored on the Hub
+
+  const refreshHubQA = async () => {
+    try {
+      const [pending, resolved] = await Promise.all([fetchPendingAPI(), fetchResolvedAPI()]);
+      setHubQA({ pending, resolved });
+    } catch {
+      // Backend unreachable — leave hubQA as-is, UI falls back to local-only state
+    }
+  };
+
+  const refreshHubLessons = async () => {
+    try {
+      const hubLessons = await fetchHubLessons();
+      setLessons((prev) => {
+        const existingIds = new Set(prev.map((l) => l.id));
+        const newOnes = hubLessons
+          .filter((hl) => !existingIds.has(hl.id))
+          .map((hl) => ({
+            id: hl.id,
+            title: hl.title,
+            subject: hl.subject,
+            size: hl.size,
+            downloaded: false,
+            completed: false,
+            videoUrl: hl.videoUrl,
+            keyPoints: hl.keyPoints || null,
+            resourceType: hl.resourceType || 'video',
+            level: hl.level || null,
+            year: hl.year || null,
+            paperType: hl.paperType || null,
+            source: 'hub',
+          }));
+        return [...prev, ...newOnes];
+      });
+    } catch {
+      // Backend unreachable — no real Hub lessons to show
+    }
+  };
+
+  const recheckBackend = async () => {
+    setBackendOnline(null);
+    const online = await checkBackendHealth();
+    setBackendOnline(online);
+    if (online) {
+      refreshHubQA();
+      refreshHubLessons();
+      showToast('Village Hub backend connected!', { icon: <CheckCircle2 className="w-6 h-6 text-green-600" /> });
+    } else {
+      showToast('Still can\u2019t reach the backend — make sure `npm start` is running in the server folder.', {
+        icon: <WifiOff className="w-6 h-6 text-amber-500" />,
+      });
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    let interval;
+
+    const check = async () => {
+      const online = await checkBackendHealth();
+      if (cancelled) return;
+      setBackendOnline(online);
+      if (online) {
+        refreshHubQA();
+        refreshHubLessons();
+        clearInterval(interval); // connected — stop polling, other flows keep it fresh from here
+      }
+    };
+
+    check(); // immediate check on load
+
+    // Keep retrying every 4s until connected — covers the common case of
+    // starting the backend server after the frontend page is already open.
+    interval = setInterval(() => {
+      if (!cancelled) check();
+    }, 4000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages, isAITyping]);
 
   // ---------- AI Tutor ----------
-  const askTutor = (rawQuery) => {
+  const askTutor = async (rawQuery) => {
     const query = rawQuery.trim();
     if (!query) return;
 
@@ -73,36 +163,80 @@ export default function EduSyncMesh() {
     setIsAITyping(true);
 
     const delay = Math.min(1800, 700 + query.length * 15);
+    await new Promise((resolve) => setTimeout(resolve, delay));
 
-    setTimeout(() => {
-      const { text, subject, unresolved } = getTutorResponse(query);
+    // Try the real Village Hub backend first — it has persistent, shared storage,
+    // so a question resolved for one student stays answered for everyone. If the
+    // backend isn't running, fall back to pure in-browser matching so the demo
+    // never breaks.
+    try {
+      const result = await askTutorAPI(query);
+
+      if (result.status === 'resolved') {
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            type: 'ai',
+            text: result.answer,
+            subject: result.subject,
+            sourceUrl: result.sourceUrl,
+            fromCache: result.cached,
+            timestamp: nowStr(),
+          },
+        ]);
+        setIsAITyping(false);
+        if (result.cached) {
+          showToast('Answered instantly from the Village Hub\u2019s stored knowledge.', {
+            icon: <CheckCircle2 className="w-6 h-6 text-green-600" />,
+          });
+        } else {
+          refreshHubQA();
+        }
+        return;
+      }
+
+      // status === 'pending'
       setChatMessages((prev) => [
         ...prev,
-        { type: 'ai', text, subject, timestamp: nowStr() },
+        { type: 'ai', text: result.message, subject: null, timestamp: nowStr() },
       ]);
       setIsAITyping(false);
+      showToast('Question saved to the Village Hub \u2014 it\u2019ll be looked up on the next Data Mule Sync, then stored offline for everyone.', {
+        icon: <Clock className="w-6 h-6 text-amber-500" />,
+      });
+      refreshHubQA();
+      return;
+    } catch {
+      // Backend unreachable — fall back to local matching + localStorage queue.
+    }
 
-      if (unresolved) {
-        setPendingQuestions((prev) => {
-          const alreadyQueued = prev.some(
-            (p) => p.question.toLowerCase() === query.toLowerCase() && p.status === 'pending'
-          );
-          if (alreadyQueued) return prev;
-          return [
-            ...prev,
-            {
-              id: Date.now(),
-              question: query,
-              askedAt: new Date().toISOString(),
-              status: 'pending',
-            },
-          ];
-        });
-        showToast('Question saved — it\u2019ll be looked up on the next Data Mule Sync.', {
-          icon: <Clock className="w-6 h-6 text-amber-500" />,
-        });
-      }
-    }, delay);
+    const { text, subject, unresolved } = getTutorResponse(query);
+    setChatMessages((prev) => [
+      ...prev,
+      { type: 'ai', text, subject, timestamp: nowStr() },
+    ]);
+    setIsAITyping(false);
+
+    if (unresolved) {
+      setPendingQuestions((prev) => {
+        const alreadyQueued = prev.some(
+          (p) => p.question.toLowerCase() === query.toLowerCase() && p.status === 'pending'
+        );
+        if (alreadyQueued) return prev;
+        return [
+          ...prev,
+          {
+            id: Date.now(),
+            question: query,
+            askedAt: new Date().toISOString(),
+            status: 'pending',
+          },
+        ];
+      });
+      showToast('Question saved locally — it\u2019ll be looked up on the next Data Mule Sync.', {
+        icon: <Clock className="w-6 h-6 text-amber-500" />,
+      });
+    }
   };
 
   const handleSendMessage = () => askTutor(userInput);
@@ -129,6 +263,55 @@ export default function EduSyncMesh() {
     });
   };
 
+  // Real download from the Village Hub — actually fetches the video bytes over
+  // the local network (proving the file is genuinely there and reachable), then
+  // marks it downloaded so the student can open it, share it via P2P, etc.
+  const handleDownloadFromHub = async (lessonId) => {
+    const lesson = lessons.find((l) => l.id === lessonId);
+    if (!lesson || lesson.downloaded || lesson.downloading) return;
+
+    setLessons((prev) => prev.map((l) => (l.id === lessonId ? { ...l, downloading: true } : l)));
+
+    try {
+      const res = await fetch(lesson.videoUrl);
+      if (!res.ok) throw new Error(`Village Hub returned ${res.status}`);
+      await res.blob(); // pull the actual bytes down, proving real local-network transfer
+
+      setLessons((prev) =>
+        prev.map((l) => (l.id === lessonId ? { ...l, downloading: false, downloaded: true } : l))
+      );
+      showToast(`Downloaded "${lesson.title}" from the Village Hub — available offline now.`, {
+        icon: <Download className="w-6 h-6 text-blue-600" />,
+      });
+    } catch (err) {
+      setLessons((prev) => prev.map((l) => (l.id === lessonId ? { ...l, downloading: false } : l)));
+      showToast(`Couldn't download "${lesson.title}" — ${err.message}`, {
+        icon: <WifiOff className="w-6 h-6 text-red-500" />,
+      });
+    }
+  };
+
+  const handleLessonUploaded = (hubLesson) => {
+    setLessons((prev) => [
+      ...prev,
+      {
+        id: hubLesson.id,
+        title: hubLesson.title,
+        subject: hubLesson.subject,
+        size: hubLesson.size,
+        downloaded: false,
+        completed: false,
+        videoUrl: hubLesson.videoUrl,
+        keyPoints: hubLesson.keyPoints || null,
+        resourceType: hubLesson.resourceType || 'video',
+        level: hubLesson.level || null,
+        year: hubLesson.year || null,
+        paperType: hubLesson.paperType || null,
+        source: 'hub',
+      },
+    ]);
+  };
+
   // ---------- P2P Share ----------
   const handleDownloadShared = (itemId) => {
     const item = sharedContent.find((i) => i.id === itemId);
@@ -143,7 +326,23 @@ export default function EduSyncMesh() {
         prev.map((i) => (i.id === itemId ? { ...i, downloading: false, downloaded: true } : i))
       );
       setDownloadedCount((prev) => prev + 1);
-      showToast(`Downloaded "${item.title}" from ${item.sharedBy} via Wi-Fi Direct — $0 data used.`, {
+
+      // A downloaded lesson isn't useful if there's nowhere to open it — add it
+      // to the learner's Library, same as a Data Mule Sync download would.
+      setLessons((prev) => [
+        ...prev,
+        {
+          id: `p2p_${item.id}_${Date.now()}`,
+          title: item.title,
+          subject: inferSubject(item.title),
+          size: item.size,
+          downloaded: true,
+          completed: false,
+          receivedFrom: item.sharedBy,
+        },
+      ]);
+
+      showToast(`Downloaded "${item.title}" from ${item.sharedBy} via Wi-Fi Direct — now in My Library.`, {
         icon: <Download className="w-6 h-6 text-blue-600" />,
       });
     }, 1400);
@@ -158,31 +357,82 @@ export default function EduSyncMesh() {
       setSyncProgress((prev) => {
         if (prev >= 100) {
           clearInterval(interval);
-          setSyncing(false);
-          setLastSynced(nowStr());
-
-          const unresolvedCount = pendingQuestions.filter((p) => p.status === 'pending').length;
-          setPendingQuestions((prevQ) =>
-            prevQ.map((p) =>
-              p.status === 'pending' ? { ...p, status: 'resolved', resolvedAt: new Date().toISOString() } : p
-            )
-          );
-
-          if (unresolvedCount > 0) {
-            showToast(
-              `Sync complete! ${unresolvedCount} queued question${unresolvedCount > 1 ? 's' : ''} looked up online — check the AI Tutor tab.`,
-              { icon: <CheckCircle2 className="w-6 h-6 text-green-600" /> }
-            );
-          } else {
-            showToast('Sync complete! New content downloaded from Village Hub.', {
-              icon: <Zap className="w-6 h-6 text-teal-600" />,
-            });
-          }
+          finishSync();
           return 100;
         }
         return prev + 10;
       });
     }, 280);
+  };
+
+  const finishSync = async () => {
+    setSyncing(false);
+    setLastSynced(nowStr());
+
+    // Try the real backend sync (actual Wikipedia lookup for queued questions).
+    try {
+      const result = await triggerSyncAPI();
+      await refreshHubQA();
+
+      if (result.resolvedCount > 0) {
+        // Continue the conversation for any of THIS user's own questions that just
+        // got resolved — rather than making them dig through a separate panel to
+        // find out their question was answered.
+        const askedByThisUser = (q) =>
+          chatMessages.some((m) => m.type === 'user' && m.text.trim().toLowerCase() === q.trim().toLowerCase());
+
+        const relevantResolutions = result.resolved.filter((r) => askedByThisUser(r.question));
+
+        if (relevantResolutions.length > 0) {
+          setChatMessages((prev) => [
+            ...prev,
+            ...relevantResolutions.map((r) => ({
+              type: 'ai',
+              text: `Following up on what you asked earlier — "${r.question}"\n\n${r.answer}`,
+              subject: null,
+              sourceUrl: r.sourceUrl,
+              synced: true,
+              timestamp: nowStr(),
+            })),
+          ]);
+        }
+
+        showToast(
+          `Sync complete! ${result.resolvedCount} question${result.resolvedCount > 1 ? 's' : ''} answered and saved permanently on the Village Hub \u2014 available offline from now on.`,
+          { icon: <CheckCircle2 className="w-6 h-6 text-green-600" /> }
+        );
+      } else if (result.stillPendingCount > 0) {
+        showToast(
+          `Sync ran, but ${result.stillPendingCount} question${result.stillPendingCount > 1 ? 's' : ''} couldn't be looked up (no internet reachable right now) — will retry next sync.`,
+          { icon: <Clock className="w-6 h-6 text-amber-500" /> }
+        );
+      } else {
+        showToast('Sync complete! New content downloaded from Village Hub.', {
+          icon: <Zap className="w-6 h-6 text-teal-600" />,
+        });
+      }
+      return;
+    } catch {
+      // Backend unreachable — fall back to resolving the local queue with search links only.
+    }
+
+    const unresolvedCount = pendingQuestions.filter((p) => p.status === 'pending').length;
+    setPendingQuestions((prevQ) =>
+      prevQ.map((p) =>
+        p.status === 'pending' ? { ...p, status: 'resolved', resolvedAt: new Date().toISOString() } : p
+      )
+    );
+
+    if (unresolvedCount > 0) {
+      showToast(
+        `Sync complete! ${unresolvedCount} queued question${unresolvedCount > 1 ? 's' : ''} looked up online — check the AI Tutor tab.`,
+        { icon: <CheckCircle2 className="w-6 h-6 text-green-600" /> }
+      );
+    } else {
+      showToast('Sync complete! New content downloaded from Village Hub.', {
+        icon: <Zap className="w-6 h-6 text-teal-600" />,
+      });
+    }
   };
 
   // ---------- Hub connection toggle (presenter-controlled) ----------
@@ -287,6 +537,9 @@ export default function EduSyncMesh() {
             <button onClick={() => { setActiveTab('hub'); setMenuOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition ${activeTab === 'hub' ? 'bg-amber-700' : 'hover:bg-amber-800'}`}>
               <Server className="w-5 h-5" /><span>Hub Test Mode</span>
             </button>
+            <button onClick={() => { setActiveTab('teacher'); setMenuOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition ${activeTab === 'teacher' ? 'bg-amber-700' : 'hover:bg-amber-800'}`}>
+              <UploadCloud className="w-5 h-5" /><span>Teacher Upload</span>
+            </button>
           </nav>
         </div>
       )}
@@ -302,6 +555,7 @@ export default function EduSyncMesh() {
                 { id: 'tutor', label: 'AI Tutor', icon: MessageSquare },
                 { id: 'share', label: 'P2P Share', icon: Users },
                 { id: 'hub', label: 'Hub Test Mode', icon: Server },
+                { id: 'teacher', label: 'Teacher Upload', icon: UploadCloud },
               ].map(({ id, label, icon: Icon }) => (
                 <button
                   key={id}
@@ -353,368 +607,54 @@ export default function EduSyncMesh() {
           {/* Main Content */}
           <main className="flex-1">
             {activeTab === 'home' && (
-              <div className="space-y-6">
-                <div className="bg-gradient-to-br from-orange-600 via-red-600 to-pink-600 rounded-3xl shadow-2xl p-8 text-white relative overflow-hidden">
-                  <div className="absolute top-0 right-0 w-64 h-64 bg-white opacity-10 rounded-full -mr-32 -mt-32" />
-                  <div className="absolute bottom-0 left-0 w-48 h-48 bg-white opacity-10 rounded-full -ml-24 -mb-24" />
-
-                  <div className="relative z-10">
-                    <h2 className="text-4xl font-black mb-3">Learn Without Limits</h2>
-                    <p className="text-xl text-orange-100 mb-6 max-w-2xl">
-                      No internet? No problem. Access ZIMSEC curriculum, AI tutoring, and peer learning—all offline.
-                    </p>
-                    <div className="flex flex-wrap gap-4">
-                      <div className="bg-white/20 backdrop-blur-sm px-6 py-3 rounded-full">
-                        <span className="text-2xl font-bold">247</span>
-                        <span className="text-sm ml-2">Lessons Downloaded</span>
-                      </div>
-                      <div className="bg-white/20 backdrop-blur-sm px-6 py-3 rounded-full">
-                        <span className="text-2xl font-bold">0 MB</span>
-                        <span className="text-sm ml-2">Data Used Today</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid md:grid-cols-3 gap-6">
-                  <div className="bg-white rounded-2xl shadow-xl p-6 hover:shadow-2xl transition-all hover:-translate-y-1">
-                    <div className="w-14 h-14 bg-gradient-to-br from-blue-500 to-purple-600 rounded-2xl flex items-center justify-center mb-4">
-                      <WifiOff className="w-7 h-7 text-white" />
-                    </div>
-                    <h3 className="text-xl font-bold text-gray-800 mb-2">Offline-First</h3>
-                    <p className="text-gray-600">All lessons stored locally. Learn anytime, anywhere—no data needed.</p>
-                  </div>
-
-                  <div className="bg-white rounded-2xl shadow-xl p-6 hover:shadow-2xl transition-all hover:-translate-y-1">
-                    <div className="w-14 h-14 bg-gradient-to-br from-green-500 to-teal-600 rounded-2xl flex items-center justify-center mb-4">
-                      <MessageSquare className="w-7 h-7 text-white" />
-                    </div>
-                    <h3 className="text-xl font-bold text-gray-800 mb-2">AI Tutor in Shona</h3>
-                    <p className="text-gray-600">Ask questions in Shona or English. Get instant answers from local AI.</p>
-                  </div>
-
-                  <div className="bg-white rounded-2xl shadow-xl p-6 hover:shadow-2xl transition-all hover:-translate-y-1">
-                    <div className="w-14 h-14 bg-gradient-to-br from-orange-500 to-red-600 rounded-2xl flex items-center justify-center mb-4">
-                      <Users className="w-7 h-7 text-white" />
-                    </div>
-                    <h3 className="text-xl font-bold text-gray-800 mb-2">Peer Sharing</h3>
-                    <p className="text-gray-600">Share lessons via Wi-Fi Direct. Earn Edu-Coins with every share!</p>
-                  </div>
-                </div>
-
-                <div className="bg-white rounded-2xl shadow-xl p-6">
-                  <h3 className="text-2xl font-bold text-gray-800 mb-4 flex items-center gap-2">
-                    <BookOpen className="w-6 h-6 text-orange-600" />
-                    Continue Learning
-                  </h3>
-                  <div className="space-y-3">
-                    {lessons.slice(0, 3).map((lesson) => (
-                      <button
-                        key={lesson.id}
-                        onClick={() => lesson.downloaded ? setViewingLesson(lesson) : showToast('Available on next sync — connect Data Mule Sync first.', { icon: <Zap className="w-6 h-6 text-amber-500" /> })}
-                        className="w-full flex items-center gap-4 p-4 bg-orange-50 rounded-xl hover:bg-orange-100 transition cursor-pointer text-left"
-                      >
-                        <div className="flex-shrink-0 w-12 h-12 bg-gradient-to-br from-orange-500 to-red-500 rounded-xl flex items-center justify-center text-white font-bold">
-                          {lesson.subject[0]}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <h4 className="font-semibold text-gray-800 truncate">{lesson.title}</h4>
-                          <p className="text-sm text-gray-600">{lesson.subject} • {lesson.size}{lesson.completed ? ' • Completed ✓' : ''}</p>
-                        </div>
-                        <ChevronRight className="w-5 h-5 text-gray-400 flex-shrink-0" />
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              <HomeTab lessons={lessons} setViewingLesson={setViewingLesson} showToast={showToast} />
             )}
 
             {activeTab === 'library' && (
-              <div className="space-y-6">
-                <div className="bg-white rounded-2xl shadow-xl p-6">
-                  <div className="flex items-center justify-between mb-6">
-                    <h2 className="text-3xl font-black text-gray-800 flex items-center gap-2">
-                      <Library className="w-8 h-8 text-orange-600" />
-                      My Library
-                    </h2>
-                    <div className="text-right">
-                      <p className="text-sm text-gray-600">Total Downloaded</p>
-                      <p className="text-2xl font-bold text-orange-600">73 MB</p>
-                    </div>
-                  </div>
-
-                  <div className="grid gap-4">
-                    {lessons.map((lesson) => (
-                      <div key={lesson.id} className="border-2 border-orange-200 rounded-2xl p-5 hover:border-orange-400 transition bg-gradient-to-r from-white to-orange-50">
-                        <div className="flex items-start gap-4">
-                          <div className={`flex-shrink-0 w-16 h-16 rounded-2xl flex items-center justify-center text-white font-bold text-2xl ${
-                            lesson.downloaded ? 'bg-gradient-to-br from-green-500 to-teal-600' : 'bg-gradient-to-br from-gray-400 to-gray-500'
-                          }`}>
-                            {lesson.subject[0]}
-                          </div>
-
-                          <div className="flex-1 min-w-0">
-                            <h3 className="text-xl font-bold text-gray-800 mb-1">
-                              {lesson.title}{lesson.completed && <span className="ml-2 text-sm text-green-600 font-semibold">✓ Completed</span>}
-                            </h3>
-                            <div className="flex flex-wrap items-center gap-3 text-sm text-gray-600 mb-3">
-                              <span className="flex items-center gap-1"><BookOpen className="w-4 h-4" />{lesson.subject}</span>
-                              <span className="flex items-center gap-1"><FileText className="w-4 h-4" />{lesson.size}</span>
-                            </div>
-
-                            {lesson.downloaded ? (
-                              <div className="flex flex-wrap gap-2">
-                                <button
-                                  onClick={() => setViewingLesson(lesson)}
-                                  className="px-4 py-2 bg-gradient-to-r from-orange-600 to-red-600 text-white rounded-lg font-semibold hover:shadow-lg transition"
-                                >
-                                  Open Lesson
-                                </button>
-                                <button
-                                  onClick={() => handleShareContent(lesson.id)}
-                                  className="px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 transition flex items-center gap-2"
-                                >
-                                  <Users className="w-4 h-4" />
-                                  Share (+5 coins)
-                                </button>
-                              </div>
-                            ) : (
-                              <button
-                                onClick={() => showToast('This lesson downloads automatically on the next Data Mule Sync.', { icon: <Zap className="w-6 h-6 text-amber-500" /> })}
-                                className="px-4 py-2 bg-gray-200 text-gray-600 rounded-lg font-semibold hover:bg-gray-300 transition"
-                              >
-                                Available on next sync
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              <LibraryTab
+                lessons={lessons}
+                setViewingLesson={setViewingLesson}
+                showToast={showToast}
+                handleShareContent={handleShareContent}
+                handleDownloadFromHub={handleDownloadFromHub}
+              />
             )}
 
             {activeTab === 'tutor' && (
-              <div className="bg-white rounded-2xl shadow-xl overflow-hidden flex flex-col" style={{ height: '640px' }}>
-                <div className="bg-gradient-to-r from-purple-600 to-indigo-600 p-6 text-white">
-                  <h2 className="text-2xl font-black flex items-center gap-2">
-                    <MessageSquare className="w-7 h-7" />
-                    AI Tutor - Offline Mode
-                  </h2>
-                  <p className="text-purple-200 text-sm mt-1">Ask in Shona or English • No internet needed • 9 ZIMSEC subjects covered</p>
-                </div>
-
-                <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-gradient-to-b from-purple-50 to-white">
-                  {chatMessages.length === 0 && (
-                    <div className="text-center py-8">
-                      <div className="w-20 h-20 bg-gradient-to-br from-purple-500 to-indigo-600 rounded-full flex items-center justify-center mx-auto mb-4">
-                        <MessageSquare className="w-10 h-10 text-white" />
-                      </div>
-                      <h3 className="text-xl font-bold text-gray-800 mb-2">Start Learning!</h3>
-                      <p className="text-gray-600 mb-4">Ask me anything about your ZIMSEC subjects</p>
-                      <div className="grid md:grid-cols-2 gap-3 max-w-2xl mx-auto">
-                        {SAMPLE_QUESTIONS.map((q) => (
-                          <button
-                            key={q}
-                            onClick={() => askTutor(q)}
-                            className="p-4 bg-purple-100 rounded-xl hover:bg-purple-200 transition text-left"
-                          >
-                            <p className="font-semibold text-purple-900 text-sm">{q}</p>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {chatMessages.map((msg, idx) => (
-                    <div key={idx} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-                      <div className={`max-w-md ${msg.type === 'user' ? 'bg-gradient-to-r from-orange-600 to-red-600 text-white' : 'bg-purple-100 text-gray-800'} rounded-2xl px-5 py-3 shadow-lg`}>
-                        {msg.subject && (
-                          <p className="text-[10px] font-bold uppercase tracking-wide text-purple-500 mb-1 flex items-center gap-1">
-                            <Sparkles className="w-3 h-3" /> {msg.subject}
-                          </p>
-                        )}
-                        <p className="text-sm mb-1 whitespace-pre-wrap">{msg.text}</p>
-                        <p className={`text-xs ${msg.type === 'user' ? 'text-orange-200' : 'text-purple-600'}`}>{msg.timestamp}</p>
-                      </div>
-                    </div>
-                  ))}
-
-                  {isAITyping && (
-                    <div className="flex justify-start">
-                      <div className="bg-purple-100 rounded-2xl px-5 py-3 shadow-lg">
-                        <div className="flex gap-1">
-                          <div className="w-2 h-2 bg-purple-600 rounded-full animate-bounce" />
-                          <div className="w-2 h-2 bg-purple-600 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }} />
-                          <div className="w-2 h-2 bg-purple-600 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  <div ref={chatEndRef} />
-                </div>
-
-                <div className="p-4 bg-gray-50 border-t-2 border-purple-200">
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={userInput}
-                      onChange={(e) => setUserInput(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                      placeholder="Type your question... (e.g., 'Explain photosynthesis' or 'Ndibatsire ne biology')"
-                      className="flex-1 px-4 py-3 rounded-xl border-2 border-purple-300 focus:border-purple-600 focus:outline-none text-gray-800"
-                    />
-                    <button
-                      onClick={handleSendMessage}
-                      disabled={!userInput.trim()}
-                      className="px-6 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-xl font-semibold hover:shadow-lg transition flex items-center gap-2 disabled:opacity-50"
-                    >
-                      <Send className="w-5 h-5" />
-                      Send
-                    </button>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-2 text-center">
-                    🔒 All AI processing happens locally on Village Hub • Zero data cost
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {activeTab === 'tutor' && pendingQuestions.length > 0 && (
-              <div className="mt-6 bg-white rounded-2xl shadow-xl p-6">
-                <h3 className="text-xl font-bold text-gray-800 mb-1 flex items-center gap-2">
-                  <HelpCircle className="w-6 h-6 text-amber-600" />
-                  Questions Waiting on Sync
-                </h3>
-                <p className="text-sm text-gray-600 mb-4">
-                  Questions the offline knowledge base couldn&apos;t answer confidently. They&apos;re looked up online
-                  automatically the next time a teacher&apos;s phone (or a USB flash drive carried on the daily
-                  commuter omnibus) syncs with an internet connection in town.
-                </p>
-                <div className="space-y-3">
-                  {pendingQuestions.slice().reverse().map((pq) => (
-                    <div
-                      key={pq.id}
-                      className={`p-4 rounded-xl border-2 ${
-                        pq.status === 'resolved' ? 'bg-green-50 border-green-300' : 'bg-amber-50 border-amber-300'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <p className="font-semibold text-gray-800 flex-1">{pq.question}</p>
-                        {pq.status === 'resolved' ? (
-                          <span className="flex-shrink-0 flex items-center gap-1 text-xs font-bold text-green-700 bg-green-100 px-2 py-1 rounded-full">
-                            <CheckCircle2 className="w-3.5 h-3.5" /> Resolved
-                          </span>
-                        ) : (
-                          <span className="flex-shrink-0 flex items-center gap-1 text-xs font-bold text-amber-700 bg-amber-100 px-2 py-1 rounded-full">
-                            <Clock className="w-3.5 h-3.5" /> Waiting for sync
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-xs text-gray-500 mt-1">
-                        Asked {new Date(pq.askedAt).toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' })}
-                      </p>
-                      {pq.status === 'resolved' ? (
-                        <a
-                          href={getSearchUrl(pq.question)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 mt-2 text-sm font-semibold text-green-700 hover:text-green-800 underline"
-                        >
-                          <ExternalLink className="w-3.5 h-3.5" />
-                          View full answer online
-                        </a>
-                      ) : (
-                        <p className="text-xs text-amber-700 mt-2">
-                          Check again after the next Data Mule Sync, or within 24 hours.
-                        </p>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
+              <AITutorTab
+                backendOnline={backendOnline}
+                hubQA={hubQA}
+                pendingQuestions={pendingQuestions}
+                chatMessages={chatMessages}
+                isAITyping={isAITyping}
+                userInput={userInput}
+                setUserInput={setUserInput}
+                handleSendMessage={handleSendMessage}
+                askTutor={askTutor}
+                recheckBackend={recheckBackend}
+                chatEndRef={chatEndRef}
+              />
             )}
 
             {activeTab === 'share' && (
-              <div className="space-y-6">
-                <div className="bg-white rounded-2xl shadow-xl p-6">
-                  <h2 className="text-3xl font-black text-gray-800 mb-2 flex items-center gap-2">
-                    <Users className="w-8 h-8 text-green-600" />
-                    Peer-to-Peer Sharing
-                  </h2>
-                  <p className="text-gray-600 mb-6">Share lessons via Wi-Fi Direct and earn Edu-Coins! No internet needed.</p>
-
-                  <div className="grid md:grid-cols-2 gap-6 mb-8">
-                    <div className="bg-gradient-to-br from-green-600 to-teal-600 rounded-2xl p-6 text-white">
-                      <Upload className="w-10 h-10 mb-3" />
-                      <h3 className="text-xl font-bold mb-2">Your Shared Content</h3>
-                      <p className="text-3xl font-black mb-1">{sharedCount} items</p>
-                      <p className="text-green-200 text-sm">Earned {eduCoins} Edu-Coins so far</p>
-                    </div>
-
-                    <div className="bg-gradient-to-br from-blue-600 to-indigo-600 rounded-2xl p-6 text-white">
-                      <Download className="w-10 h-10 mb-3" />
-                      <h3 className="text-xl font-bold mb-2">Downloaded from Peers</h3>
-                      <p className="text-3xl font-black mb-1">{downloadedCount} items</p>
-                      <p className="text-blue-200 text-sm">Saved approximately ${(downloadedCount * 0.3).toFixed(2)} in data</p>
-                    </div>
-                  </div>
-
-                  <h3 className="text-xl font-bold text-gray-800 mb-4">Available from Nearby Students</h3>
-                  <div className="space-y-4">
-                    {sharedContent.map((item) => (
-                      <div key={item.id} className="border-2 border-green-200 rounded-2xl p-5 hover:border-green-400 transition bg-gradient-to-r from-white to-green-50">
-                        <div className="flex items-start justify-between gap-4">
-                          <div className="flex-1">
-                            <h4 className="text-lg font-bold text-gray-800 mb-1">{item.title}</h4>
-                            <div className="flex flex-wrap items-center gap-3 text-sm text-gray-600">
-                              <span className="flex items-center gap-1"><Users className="w-4 h-4" />Shared by {item.sharedBy}</span>
-                              <span className="flex items-center gap-1"><FileText className="w-4 h-4" />{item.size}</span>
-                              <span className="flex items-center gap-1 text-yellow-600 font-semibold"><Award className="w-4 h-4" />+{item.coins} coins to share</span>
-                            </div>
-                          </div>
-                          <button
-                            onClick={() => handleDownloadShared(item.id)}
-                            disabled={item.downloading || item.downloaded}
-                            className={`px-4 py-2 rounded-lg font-semibold whitespace-nowrap transition flex items-center gap-2 ${
-                              item.downloaded
-                                ? 'bg-green-100 text-green-700 cursor-default'
-                                : 'bg-green-600 text-white hover:bg-green-700'
-                            } disabled:opacity-80`}
-                          >
-                            {item.downloading && <Loader2 className="w-4 h-4 animate-spin" />}
-                            {item.downloaded && <CheckCircle2 className="w-4 h-4" />}
-                            {item.downloaded ? 'Downloaded' : item.downloading ? 'Transferring…' : 'Download via Wi-Fi Direct'}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="bg-gradient-to-r from-yellow-500 to-orange-500 rounded-2xl shadow-xl p-6 text-white">
-                  <Trophy className="w-12 h-12 mb-3" />
-                  <h3 className="text-2xl font-bold mb-2">Leaderboard - Top Sharers This Month</h3>
-                  <div className="space-y-2 mt-4">
-                    <div className="flex items-center justify-between bg-white/20 backdrop-blur-sm rounded-xl p-3">
-                      <span className="font-semibold">1. Tendai M.</span>
-                      <span className="font-bold">234 Edu-Coins</span>
-                    </div>
-                    <div className="flex items-center justify-between bg-white/20 backdrop-blur-sm rounded-xl p-3">
-                      <span className="font-semibold">2. Chipo K.</span>
-                      <span className="font-bold">189 Edu-Coins</span>
-                    </div>
-                    <div className="flex items-center justify-between bg-white/20 backdrop-blur-sm rounded-xl p-3">
-                      <span className="font-semibold">3. You</span>
-                      <span className="font-bold">{eduCoins} Edu-Coins</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
+              <P2PShareTab
+                sharedContent={sharedContent}
+                sharedCount={sharedCount}
+                downloadedCount={downloadedCount}
+                eduCoins={eduCoins}
+                handleDownloadShared={handleDownloadShared}
+              />
             )}
 
             {activeTab === 'hub' && <HubTestMode />}
+
+            {activeTab === 'teacher' && (
+              <TeacherUpload
+                backendOnline={backendOnline}
+                onUploaded={handleLessonUploaded}
+                showToast={showToast}
+              />
+            )}
           </main>
         </div>
       </div>
@@ -736,6 +676,7 @@ export default function EduSyncMesh() {
             { id: 'tutor', label: 'Tutor', icon: MessageSquare },
             { id: 'share', label: 'Share', icon: Users },
             { id: 'hub', label: 'Hub', icon: Server },
+            { id: 'teacher', label: 'Upload', icon: UploadCloud },
           ].map(({ id, label, icon: Icon }) => (
             <button
               key={id}
@@ -752,6 +693,23 @@ export default function EduSyncMesh() {
       </nav>
     </div>
   );
+}
+
+function inferSubject(title) {
+  const t = title.toLowerCase();
+  const map = [
+    ['math', 'Maths'], ['maths', 'Maths'],
+    ['chemistry', 'Chemistry'],
+    ['biology', 'Biology'],
+    ['physics', 'Physics'],
+    ['english', 'English'],
+    ['shona', 'Shona'],
+    ['geography', 'Geography'],
+    ['history', 'History'],
+    ['commerce', 'Commerce'], ['accounting', 'Commerce'], ['business', 'Commerce'],
+  ];
+  const found = map.find(([keyword]) => t.includes(keyword));
+  return found ? found[1] : 'General';
 }
 
 function nowStr() {
